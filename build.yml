@@ -1,0 +1,648 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Write sources
+        run: |
+          mkdir -p PhoneBot
+          cat > PhoneBot/README.md <<'END_FILE_0'
+          # Phone Bot (Android)
+
+          Плавающая кнопка 🤖 открывает мини-чат. Ты пишешь команду, ИИ читает экран
+          через службу специальных возможностей и нажимает/вводит/листает по шагам.
+
+          ## Сборка
+          1. Установи Android Studio, открой папку PhoneBot (File > Open).
+          2. Подожди синхронизацию Gradle (при запросе обнови версии плагинов).
+          3. Подключи телефон по USB (включи отладку) и нажми Run.
+
+          ## Первый запуск
+          1. В приложении вставь бесплатный API-ключ Google Gemini, нажми «Сохранить».
+          2. «Открыть спец. возможности» > Phone Bot > включить.
+             (Если Android блокирует: Настройки > Приложения > Phone Bot > ⋮ > «Разрешить ограниченные настройки».)
+          3. Появится кнопка 🤖. Нажми её, напиши команду, нажми ▶. ■ останавливает бота.
+
+          ## Ограничения
+          - Лимит 25 шагов на команду (константа в Agent.kt).
+          - Некоторые приложения (банки) блокируют чтение экрана.
+          - Каждый шаг отправляет текст экрана в API Google Gemini: не используй с чувствительными данными.
+          END_FILE_0
+          mkdir -p PhoneBot/app
+          cat > PhoneBot/app/build.gradle.kts <<'END_FILE_1'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.phonebot"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.phonebot"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          END_FILE_1
+          mkdir -p PhoneBot/app/src/main
+          cat > PhoneBot/app/src/main/AndroidManifest.xml <<'END_FILE_2'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+              <application
+                  android:label="Phone Bot"
+                  android:theme="@android:style/Theme.Material.Light">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".BotService"
+                      android:exported="true"
+                      android:label="Phone Bot"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          END_FILE_2
+          mkdir -p PhoneBot/app/src/main/java/com/example/phonebot
+          cat > PhoneBot/app/src/main/java/com/example/phonebot/Agent.kt <<'END_FILE_3'
+          package com.example.phonebot
+
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          class Agent(private val apiKey: String, private val model: String, private val log: (String) -> Unit) {
+              @Volatile var stopped = false
+
+              private val system = """
+          Ты управляешь Android-телефоном по команде пользователя. На каждом шаге ты видишь список элементов текущего экрана и отвечаешь ОДНИМ JSON-объектом без пояснений. Варианты:
+          {"action":"click","id":N}
+          {"action":"type","id":N,"text":"..."}
+          {"action":"scroll","dir":"up"} или {"action":"scroll","dir":"down"}
+          {"action":"tap","x":0-1000,"y":0-1000}
+          {"action":"back"}
+          {"action":"home"}
+          {"action":"open_app","name":"название приложения"}
+          {"action":"wait"}
+          {"action":"done","message":"что сделано"}
+          Правила: делай один шаг за раз. Действие tap нужно, когда нужного элемента нет в списке (например, в играх): тогда к сообщению приложен скриншот, а x и y это координаты на нём (0,0 слева сверху, 1000,1000 справа снизу). Не совершай платежи, не удаляй данные и не меняй пароли без прямой просьбы пользователя. Если задача выполнена или невозможна, верни done.
+          """.trimIndent()
+
+              fun run(task: String) {
+                  val actions = mutableListOf<String>()
+                  var step = 0
+                  while (!stopped && step < 25) {
+                      step++
+                      val svc = BotService.instance
+                      if (svc == null) { log("Служба доступа не включена"); return }
+                      val screen = svc.dumpScreen()
+                      val shot = if (svc.nodeCount < 6) svc.screenshotBase64() else null
+                      val prompt = "Задача: $task\n\nУже сделано:\n" +
+                          (if (actions.isEmpty()) "ничего" else actions.joinToString("\n")) +
+                          "\n\nТекущий экран:\n$screen" +
+                          (if (shot != null) "\n\nК сообщению приложен скриншот: в экране почти нет элементов (похоже на игру). Ориентируйся по картинке и используй tap." else "")
+                      val reply = try { call(prompt, shot) } catch (e: Exception) { log("Ошибка: ${e.message}"); return }
+                      val json = parse(reply)
+                      if (json == null) { log("Не понял ответ: ${reply.take(100)}"); return }
+                      val action = json.optString("action")
+                      val detail = if (action == "tap") "${json.optInt("x")},${json.optInt("y")}"
+                          else "${json.optString("text")}${json.optString("name")}${json.optString("dir")}"
+                      log("→ $action $detail")
+                      when (action) {
+                          "click" -> svc.click(json.optInt("id", -1))
+                          "type" -> svc.type(json.optInt("id", -1), json.optString("text"))
+                          "scroll" -> svc.scroll(json.optString("dir") == "down")
+                          "tap" -> svc.tap(json.optInt("x"), json.optInt("y"))
+                          "back" -> svc.back()
+                          "home" -> svc.home()
+                          "open_app" -> svc.openApp(json.optString("name"))
+                          "wait" -> {}
+                          "done" -> { log("✓ " + json.optString("message")); return }
+                          else -> { log("Неизвестное действие: $action"); return }
+                      }
+                      actions.add(json.toString().take(120))
+                      Thread.sleep(1200)
+                  }
+                  log(if (stopped) "Остановлено" else "Достигнут лимит шагов")
+              }
+
+              private fun parse(text: String): JSONObject? {
+                  val a = text.indexOf('{')
+                  val b = text.lastIndexOf('}')
+                  if (a < 0 || b <= a) return null
+                  return try { JSONObject(text.substring(a, b + 1)) } catch (e: Exception) { null }
+              }
+
+              private fun call(prompt: String, image: String?): String {
+                  val parts = JSONArray()
+                  if (image != null) {
+                      parts.put(JSONObject().put("inline_data", JSONObject().put("mime_type", "image/jpeg").put("data", image)))
+                  }
+                  parts.put(JSONObject().put("text", prompt))
+                  val body = JSONObject()
+                      .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", system))))
+                      .put("contents", JSONArray().put(JSONObject()
+                          .put("role", "user")
+                          .put("parts", parts)))
+                      .put("generationConfig", JSONObject().put("maxOutputTokens", 1000).put("responseMimeType", "application/json"))
+                  var attempt = 0
+                  while (true) {
+                      attempt++
+                      val c = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent")
+                          .openConnection() as HttpURLConnection
+                      c.requestMethod = "POST"
+                      c.setRequestProperty("x-goog-api-key", apiKey)
+                      c.setRequestProperty("content-type", "application/json")
+                      c.doOutput = true
+                      c.outputStream.use { it.write(body.toString().toByteArray()) }
+                      val code = c.responseCode
+                      val text = (if (code < 400) c.inputStream else c.errorStream).bufferedReader().readText()
+                      if (code == 429 && attempt < 4 && !stopped) {
+                          log("Лимит запросов, жду 20 сек...")
+                          Thread.sleep(20000)
+                          continue
+                      }
+                      if (code >= 400) throw Exception("HTTP $code: ${text.take(150)}")
+                      return JSONObject(text).getJSONArray("candidates").getJSONObject(0)
+                          .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text")
+                  }
+              }
+          }
+          END_FILE_3
+          mkdir -p PhoneBot/app/src/main/java/com/example/phonebot
+          cat > PhoneBot/app/src/main/java/com/example/phonebot/BotService.kt <<'END_FILE_4'
+          package com.example.phonebot
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Intent
+          import android.graphics.Bitmap
+          import android.graphics.Path
+          import android.util.Base64
+          import android.view.Display
+          import java.io.ByteArrayOutputStream
+          import java.util.concurrent.CountDownLatch
+          import java.util.concurrent.TimeUnit
+          import android.os.Bundle
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+
+          class BotService : AccessibilityService() {
+              companion object {
+                  @Volatile var instance: BotService? = null
+              }
+
+              private var nodes: List<AccessibilityNodeInfo> = emptyList()
+              private var overlay: Overlay? = null
+              @Volatile var nodeCount = 0
+
+              override fun onServiceConnected() {
+                  instance = this
+                  overlay = Overlay(this).also { it.show() }
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              override fun onDestroy() {
+                  overlay?.hide()
+                  instance = null
+                  super.onDestroy()
+              }
+
+              /** Текстовое описание текущего экрана для ИИ. */
+              fun dumpScreen(): String {
+                  val root = rootInActiveWindow ?: return "(экран недоступен)"
+                  val list = mutableListOf<AccessibilityNodeInfo>()
+                  collect(root, list)
+                  nodes = list
+                  nodeCount = list.size
+                  val sb = StringBuilder("Приложение: ${root.packageName}\n")
+                  list.forEachIndexed { i, n ->
+                      val label = (n.text ?: n.contentDescription ?: "").toString().take(80)
+                      val flags = buildList {
+                          if (n.isClickable) add("клик")
+                          if (n.isEditable) add("ввод")
+                          if (n.isScrollable) add("скролл")
+                      }
+                      sb.append("[$i] $label (${flags.joinToString(",")})\n")
+                  }
+                  return sb.toString()
+              }
+
+              private fun collect(n: AccessibilityNodeInfo?, out: MutableList<AccessibilityNodeInfo>) {
+                  if (n == null || !n.isVisibleToUser) return
+                  val has = !n.text.isNullOrEmpty() || !n.contentDescription.isNullOrEmpty() ||
+                      n.isClickable || n.isEditable
+                  if (has && out.size < 150) out.add(n)
+                  for (i in 0 until n.childCount) collect(n.getChild(i), out)
+              }
+
+              fun click(id: Int): Boolean {
+                  var n: AccessibilityNodeInfo? = nodes.getOrNull(id)
+                  while (n != null && !n.isClickable) n = n.parent
+                  return n?.performAction(AccessibilityNodeInfo.ACTION_CLICK) ?: false
+              }
+
+              fun type(id: Int, text: String): Boolean {
+                  val n = nodes.getOrNull(id) ?: return false
+                  val args = Bundle().apply {
+                      putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+                  }
+                  return n.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+              }
+
+              /** down = показать то, что ниже (палец идёт снизу вверх). */
+              fun scroll(down: Boolean) {
+                  val dm = resources.displayMetrics
+                  val x = dm.widthPixels / 2f
+                  val low = dm.heightPixels * 0.7f
+                  val high = dm.heightPixels * 0.3f
+                  val path = Path().apply {
+                      if (down) { moveTo(x, low); lineTo(x, high) } else { moveTo(x, high); lineTo(x, low) }
+                  }
+                  gesture(path, 300)
+              }
+
+              /** Касание по координатам 0..1000 (как на скриншоте). */
+              fun tap(nx: Int, ny: Int) {
+                  val dm = resources.displayMetrics
+                  val x = nx.coerceIn(0, 1000) / 1000f * dm.widthPixels
+                  val y = ny.coerceIn(0, 1000) / 1000f * dm.heightPixels
+                  val path = Path().apply { moveTo(x, y) }
+                  gesture(path, 60)
+              }
+
+              private fun gesture(path: Path, duration: Long) {
+                  overlay?.passThrough(true)   // окно бота не должно перехватывать касание
+                  Thread.sleep(150)
+                  val stroke = GestureDescription.StrokeDescription(path, 0, duration)
+                  dispatchGesture(GestureDescription.Builder().addStroke(stroke).build(), null, null)
+                  Thread.sleep(duration + 300)
+                  overlay?.passThrough(false)
+              }
+
+              /** Скриншот экрана в base64 JPEG (нужен Android 11+). Окно бота на время съёмки скрывается. */
+              fun screenshotBase64(): String? {
+                  if (android.os.Build.VERSION.SDK_INT < 30) return null
+                  overlay?.passThrough(true)
+                  Thread.sleep(250)
+                  var result: String? = null
+                  val latch = CountDownLatch(1)
+                  takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : AccessibilityService.TakeScreenshotCallback {
+                      override fun onSuccess(s: AccessibilityService.ScreenshotResult) {
+                          try {
+                              val hw = Bitmap.wrapHardwareBuffer(s.hardwareBuffer, s.colorSpace)
+                              val bmp = hw?.copy(Bitmap.Config.ARGB_8888, false)
+                              s.hardwareBuffer.close()
+                              if (bmp != null) {
+                                  val w = 540
+                                  val h = bmp.height * w / bmp.width
+                                  val scaled = Bitmap.createScaledBitmap(bmp, w, h, true)
+                                  val out = ByteArrayOutputStream()
+                                  scaled.compress(Bitmap.CompressFormat.JPEG, 60, out)
+                                  result = Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+                              }
+                          } catch (e: Exception) {
+                          }
+                          latch.countDown()
+                      }
+
+                      override fun onFailure(errorCode: Int) {
+                          latch.countDown()
+                      }
+                  })
+                  latch.await(5, TimeUnit.SECONDS)
+                  overlay?.passThrough(false)
+                  return result
+              }
+
+              fun back() = performGlobalAction(GLOBAL_ACTION_BACK)
+              fun home() = performGlobalAction(GLOBAL_ACTION_HOME)
+
+              fun openApp(name: String): Boolean {
+                  val pm = packageManager
+                  val query = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  val app = pm.queryIntentActivities(query, 0)
+                      .firstOrNull { it.loadLabel(pm).toString().contains(name, ignoreCase = true) } ?: return false
+                  val launch = pm.getLaunchIntentForPackage(app.activityInfo.packageName) ?: return false
+                  launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  startActivity(launch)
+                  return true
+              }
+          }
+          END_FILE_4
+          mkdir -p PhoneBot/app/src/main/java/com/example/phonebot
+          cat > PhoneBot/app/src/main/java/com/example/phonebot/MainActivity.kt <<'END_FILE_5'
+          package com.example.phonebot
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val prefs = getSharedPreferences("bot", MODE_PRIVATE)
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad, pad, pad)
+                  }
+                  val info = TextView(this).apply {
+                      text = "1) Вставь бесплатный API-ключ Google Gemini (aistudio.google.com/app/apikey) и нажми «Сохранить».\n" +
+                          "2) Включи службу «Phone Bot» в настройках специальных возможностей.\n" +
+                          "3) На экране появится кнопка 🤖. Нажми её и пиши команды."
+                  }
+                  val key = EditText(this).apply {
+                      hint = "AIza..."
+                      setText(prefs.getString("key", ""))
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                  }
+                  val model = EditText(this).apply {
+                      hint = "Модель"
+                      setText(prefs.getString("model", "gemini-flash-lite-latest"))
+                  }
+                  val save = Button(this).apply {
+                      text = "Сохранить ключ"
+                      setOnClickListener {
+                          prefs.edit()
+                              .putString("key", key.text.toString().trim())
+                              .putString("model", model.text.toString().trim().ifEmpty { "gemini-flash-lite-latest" })
+                              .apply()
+                          Toast.makeText(this@MainActivity, "Сохранено", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+                  val acc = Button(this).apply {
+                      text = "Открыть спец. возможности"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  }
+                  root.addView(info)
+                  root.addView(key)
+                  root.addView(model)
+                  root.addView(save)
+                  root.addView(acc)
+                  setContentView(root)
+              }
+          }
+          END_FILE_5
+          mkdir -p PhoneBot/app/src/main/java/com/example/phonebot
+          cat > PhoneBot/app/src/main/java/com/example/phonebot/Overlay.kt <<'END_FILE_6'
+          package com.example.phonebot
+
+          import android.content.Context
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.WindowManager.LayoutParams as LP
+          import android.view.inputmethod.InputMethodManager
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import java.util.concurrent.CountDownLatch
+          import java.util.concurrent.TimeUnit
+          import kotlin.math.abs
+
+          class Overlay(private val svc: BotService) {
+              private val wm = svc.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+              private val ui = Handler(Looper.getMainLooper())
+              private val bubble = TextView(svc)
+              private val panel = LinearLayout(svc)
+              private val logView = TextView(svc)
+              private val scroll = ScrollView(svc)
+              private val input = EditText(svc)
+              private var panelShown = false
+              private var agent: Agent? = null
+
+              private fun dp(v: Int) = (v * svc.resources.displayMetrics.density).toInt()
+
+              private fun params(w: Int, h: Int, flags: Int) =
+                  LP(w, h, LP.TYPE_ACCESSIBILITY_OVERLAY, flags, PixelFormat.TRANSLUCENT)
+
+              private val bubbleLp = params(dp(56), dp(56), LP.FLAG_NOT_FOCUSABLE or LP.FLAG_NOT_TOUCH_MODAL).apply {
+                  gravity = Gravity.TOP or Gravity.START
+                  x = 0
+                  y = dp(200)
+              }
+              private val panelLp = params(
+                  (svc.resources.displayMetrics.widthPixels * 0.94).toInt(),
+                  LP.WRAP_CONTENT,
+                  LP.FLAG_NOT_TOUCH_MODAL
+              ).apply {
+                  gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                  y = dp(80)
+                  softInputMode = LP.SOFT_INPUT_ADJUST_RESIZE
+              }
+
+              init {
+                  bubble.text = "🤖"
+                  bubble.textSize = 24f
+                  bubble.gravity = Gravity.CENTER
+                  bubble.background = GradientDrawable().apply {
+                      shape = GradientDrawable.OVAL
+                      setColor(Color.parseColor("#CC1F2937"))
+                  }
+                  bubble.setOnTouchListener(object : View.OnTouchListener {
+                      var sx = 0f; var sy = 0f; var ox = 0; var oy = 0; var moved = false
+                      override fun onTouch(v: View, e: MotionEvent): Boolean {
+                          when (e.action) {
+                              MotionEvent.ACTION_DOWN -> { sx = e.rawX; sy = e.rawY; ox = bubbleLp.x; oy = bubbleLp.y; moved = false }
+                              MotionEvent.ACTION_MOVE -> {
+                                  val dx = e.rawX - sx; val dy = e.rawY - sy
+                                  if (abs(dx) > 10 || abs(dy) > 10) moved = true
+                                  if (moved) {
+                                      bubbleLp.x = ox + dx.toInt(); bubbleLp.y = oy + dy.toInt()
+                                      wm.updateViewLayout(bubble, bubbleLp)
+                                  }
+                              }
+                              MotionEvent.ACTION_UP -> if (!moved) togglePanel()
+                          }
+                          return true
+                      }
+                  })
+
+                  panel.orientation = LinearLayout.VERTICAL
+                  panel.setPadding(dp(10), dp(10), dp(10), dp(10))
+                  panel.background = GradientDrawable().apply {
+                      cornerRadius = dp(16).toFloat()
+                      setColor(Color.parseColor("#F01F2937"))
+                  }
+                  logView.setTextColor(Color.WHITE)
+                  logView.textSize = 14f
+                  logView.text = "Напиши, что сделать на телефоне.\n"
+                  scroll.addView(logView)
+                  panel.addView(scroll, LinearLayout.LayoutParams(LP.MATCH_PARENT, dp(160)))
+
+                  val row = LinearLayout(svc).apply { orientation = LinearLayout.HORIZONTAL }
+                  input.hint = "Команда..."
+                  input.setHintTextColor(Color.GRAY)
+                  input.setTextColor(Color.WHITE)
+                  row.addView(input, LinearLayout.LayoutParams(0, LP.WRAP_CONTENT, 1f))
+                  val send = Button(svc).apply { text = "▶"; setOnClickListener { send() } }
+                  val stop = Button(svc).apply { text = "■"; setOnClickListener { agent?.stopped = true } }
+                  row.addView(send, LinearLayout.LayoutParams(dp(52), dp(48)))
+                  row.addView(stop, LinearLayout.LayoutParams(dp(52), dp(48)))
+                  panel.addView(row)
+              }
+
+              /** Скрыть окна бота и сделать их «прозрачными» для касаний (на время скриншота и жестов). */
+              fun passThrough(on: Boolean) {
+                  val latch = CountDownLatch(1)
+                  ui.post {
+                      try {
+                          val vis = if (on) View.INVISIBLE else View.VISIBLE
+                          val flag = LP.FLAG_NOT_TOUCHABLE
+                          bubble.visibility = vis
+                          panel.visibility = vis
+                          bubbleLp.flags = if (on) bubbleLp.flags or flag else bubbleLp.flags and flag.inv()
+                          panelLp.flags = if (on) panelLp.flags or flag else panelLp.flags and flag.inv()
+                          wm.updateViewLayout(bubble, bubbleLp)
+                          if (panelShown) wm.updateViewLayout(panel, panelLp)
+                      } catch (_: Exception) {
+                      }
+                      latch.countDown()
+                  }
+                  latch.await(2, TimeUnit.SECONDS)
+              }
+
+              fun show() { wm.addView(bubble, bubbleLp) }
+
+              fun hide() {
+                  try { wm.removeView(bubble) } catch (_: Exception) {}
+                  if (panelShown) try { wm.removeView(panel) } catch (_: Exception) {}
+              }
+
+              private fun togglePanel() {
+                  if (panelShown) wm.removeView(panel) else wm.addView(panel, panelLp)
+                  panelShown = !panelShown
+              }
+
+              private fun setFocusable(on: Boolean) {
+                  panelLp.flags = if (on) panelLp.flags and LP.FLAG_NOT_FOCUSABLE.inv()
+                  else panelLp.flags or LP.FLAG_NOT_FOCUSABLE
+                  if (panelShown) wm.updateViewLayout(panel, panelLp)
+              }
+
+              private fun log(s: String) = ui.post {
+                  logView.append(s + "\n")
+                  scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+              }
+
+              private fun send() {
+                  val task = input.text.toString().trim()
+                  if (task.isEmpty()) return
+                  val prefs = svc.getSharedPreferences("bot", Context.MODE_PRIVATE)
+                  val key = prefs.getString("key", "") ?: ""
+                  val model = prefs.getString("model", "gemini-flash-lite-latest") ?: "gemini-flash-lite-latest"
+                  if (key.isEmpty()) { log("Сначала сохрани API-ключ в приложении Phone Bot"); return }
+                  input.setText("")
+                  log("Ты: $task")
+                  // Окно чата не должно забирать фокус, иначе бот не увидит приложение под ним.
+                  (svc.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager)
+                      .hideSoftInputFromWindow(input.windowToken, 0)
+                  setFocusable(false)
+                  val a = Agent(key, model) { log(it) }
+                  agent = a
+                  Thread {
+                      a.run(task)
+                      ui.post { setFocusable(true) }
+                  }.start()
+              }
+          }
+          END_FILE_6
+          mkdir -p PhoneBot/app/src/main/res/values
+          cat > PhoneBot/app/src/main/res/values/strings.xml <<'END_FILE_7'
+          <resources>
+              <string name="service_desc">Позволяет боту читать экран и выполнять действия по твоей команде.</string>
+          </resources>
+          END_FILE_7
+          mkdir -p PhoneBot/app/src/main/res/xml
+          cat > PhoneBot/app/src/main/res/xml/accessibility_config.xml <<'END_FILE_8'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault"
+              android:canRetrieveWindowContent="true"
+              android:canPerformGestures="true"
+              android:canTakeScreenshot="true"
+              android:description="@string/service_desc"
+              android:notificationTimeout="100" />
+          END_FILE_8
+          mkdir -p PhoneBot
+          cat > PhoneBot/build.gradle.kts <<'END_FILE_9'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          END_FILE_9
+          mkdir -p PhoneBot
+          cat > PhoneBot/gradle.properties <<'END_FILE_10'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=false
+          END_FILE_10
+          mkdir -p PhoneBot
+          cat > PhoneBot/settings.gradle.kts <<'END_FILE_11'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "PhoneBot"
+          include(":app")
+          END_FILE_11
+      - name: Build
+        working-directory: PhoneBot
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PhoneBot-apk
+          path: PhoneBot/app/build/outputs/apk/debug/app-debug.apk
